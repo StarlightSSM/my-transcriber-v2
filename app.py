@@ -157,7 +157,9 @@ werkzeug_logger.setLevel(logging.INFO)
 # =========================================================
 
 latest_result = {
+    "stem": "",
     "text": "",
+    "summary": "",
     "segments": []
 }
 
@@ -651,13 +653,21 @@ def download(fmt):
         # PDF
         elif fmt == "pdf":
 
-            paragraphs = group_into_paragraphs(
-                segments
-            )
+            with state_lock:
+                stem = latest_result.get("stem", "result")
+                text = latest_result.get("text", "")
+                summary = latest_result.get("summary", "")
 
             export_pdf(
-                paragraphs,
-                output_path
+                stem,
+                text,
+                summary,
+                OUTPUT_FOLDER
+            )
+
+            output_path = os.path.join(
+                OUTPUT_FOLDER,
+                f"{stem}_analysis.pdf"
             )
 
         else:

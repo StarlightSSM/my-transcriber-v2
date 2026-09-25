@@ -62,26 +62,13 @@
   </section>
 
   <section id="result" class="hidden">
-    <div class="grid">
-      <div class="card">
-        <h2>요약</h2>
-        <div id="overview" class="summary"></div>
-        <h3>핵심 내용</h3>
-        <ul id="keyPoints"></ul>
-        <h3>키워드</h3>
-        <div id="keywords" class="summary"></div>
-      </div>
-      <div class="card">
-        <h2>챕터</h2>
-        <div id="chapters"></div>
-        <h2 style="margin-top:24px">다운로드</h2>
-        <div class="actions">
-          <button class="button secondary" onclick="download('txt')">TXT</button>
-          <button class="button secondary" onclick="download('srt')">SRT</button>
-          <button class="button secondary" onclick="download('docx')">DOCX</button>
-          <button class="button secondary" onclick="download('pdf')">PDF</button>
-          <button class="button secondary" onclick="download('json')">JSON</button>
-        </div>
+    <div class="card">
+      <h2>다운로드</h2>
+      <div class="actions">
+        <button class="button secondary" onclick="download('txt')">TXT</button>
+        <button class="button secondary" onclick="download('srt')">SRT</button>
+        <button class="button secondary" onclick="download('docx')">DOCX</button>
+        <button class="button secondary" onclick="download('pdf')">PDF</button>
       </div>
     </div>
     <div class="card">
@@ -93,7 +80,6 @@
 
 <script>
 let selectedFile = null;
-let currentJob = null;
 
 const $ = id => document.getElementById(id);
 const fileInput = $("file");
@@ -135,7 +121,6 @@ $("start").addEventListener("click", async () => {
     const res = await fetch("/api/upload", { method:"POST", body:form });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "업로드 실패");
-    currentJob = data.job_id;
     poll();
   } catch (err) {
     $("error").textContent = err.message;
@@ -144,85 +129,60 @@ $("start").addEventListener("click", async () => {
 });
 
 async function poll() {
-  const res = await fetch(`/api/jobs/${currentJob}`);
-  const job = await res.json();
+  const res = await fetch("/api/progress");
+  const state = await res.json();
   if (!res.ok) {
-    $("error").textContent = job.error || "상태 확인 실패";
-    return;
-  }
-
-  $("bar").style.width = `${job.progress}%`;
-  $("percent").textContent = `${job.progress}%`;
-
-  const labels = {
-    queued:"작업 대기 중…",
-    transcribing:"음성을 텍스트로 변환하는 중…",
-    summarizing:"강의 내용을 요약하는 중…",
-    done:"완료되었습니다.",
-    error:"오류가 발생했습니다."
-  };
-  $("statusText").textContent = labels[job.status] || job.status;
-  $("error").textContent = job.error || "";
-
-  if (job.status === "done") {
-    renderResult(job);
+    $("error").textContent = state.error || "상태 확인 실패";
     $("start").disabled = false;
     return;
   }
-  if (job.status === "error") {
+
+  $("bar").style.width = `${state.percent}%`;
+  $("percent").textContent = `${state.percent}%`;
+
+  const labels = {
+    idle:"대기 중…",
+    processing:"음성을 텍스트로 변환하는 중…",
+    done:"완료되었습니다.",
+    error:"오류가 발생했습니다."
+  };
+  $("statusText").textContent = labels[state.status] || state.status;
+  $("error").textContent = state.error || "";
+
+  if (state.status === "done") {
+    await loadResult();
+    $("start").disabled = false;
+    return;
+  }
+  if (state.status === "error") {
     $("start").disabled = false;
     return;
   }
   setTimeout(poll, 1000);
 }
 
-function renderResult(job) {
+async function loadResult() {
+  const res = await fetch("/api/result");
+  const data = await res.json();
+  if (!res.ok) {
+    $("error").textContent = data.error || "결과를 가져오지 못했습니다.";
+    return;
+  }
   $("result").classList.remove("hidden");
-  const summary = job.summary || {};
-  $("overview").textContent = summary.overview || "요약을 생성하지 못했습니다.";
-
-  $("keyPoints").innerHTML = "";
-  (summary.key_points || []).forEach(x => {
-    const li = document.createElement("li");
-    li.textContent = x;
-    $("keyPoints").appendChild(li);
-  });
-
-  $("keywords").textContent = (summary.keywords || []).join(" · ");
-
-  $("chapters").innerHTML = "";
-  (summary.chapters || []).forEach(ch => {
-    const div = document.createElement("div");
-    div.className = "chapter";
-    const time = document.createElement("strong");
-    time.textContent = formatTime(ch.start);
-    const title = document.createElement("span");
-    title.textContent = ch.title;
-    div.append(time, title);
-    $("chapters").appendChild(div);
-  });
-
-  $("transcript").textContent = job.transcript || "";
-}
-
-function formatTime(sec) {
-  const total = Math.max(0, Math.floor(Number(sec) || 0));
-  const m = Math.floor(total / 60);
-  const s = total % 60;
-  return `${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`;
+  $("transcript").textContent = data.text || "";
 }
 
 function download(kind) {
-  if (currentJob) location.href = `/api/jobs/${currentJob}/export/${kind}`;
+  location.href = `/api/download/${kind}`;
 }
 
 async function checkHealth() {
   try {
     const res = await fetch("/api/health");
     const data = await res.json();
-    $("ollamaStatus").textContent = data.ollama
-      ? `Ollama 연결됨 · ${data.model}`
-      : "Ollama 미연결 · 전사만 사용 가능";
+    $("ollamaStatus").textContent = data.status === "ok"
+      ? "서버 정상 작동 중"
+      : (data.message || "서버 상태 확인 실패");
   } catch {
     $("ollamaStatus").textContent = "서버 상태 확인 실패";
   }

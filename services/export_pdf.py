@@ -1,116 +1,393 @@
-from pathlib import Path
+import os
 
 from reportlab.lib.pagesizes import A4
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import (
-    SimpleDocTemplate,
-    Paragraph,
-    Spacer,
-)
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.pdfgen import canvas
 
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+
+
+# ============================================================
+# 한글 폰트
+# ============================================================
+
+FONT_NAME = "HYSMyeongJo-Medium"
+
+pdfmetrics.registerFont(
+    UnicodeCIDFont(
+        FONT_NAME
+    )
+)
+
+
+# ============================================================
+# 파일명 정리
+# ============================================================
 
 def _safe_stem(stem):
-    return "".join(
-        c if c not in '\\/:*?"<>|' else "_"
-        for c in stem
+
+    stem = str(
+        stem or "result"
+    ).strip()
+
+
+    # 확장자 제거
+    if "." in stem:
+
+        stem = stem.rsplit(
+            ".",
+            1
+        )[0]
+
+
+    result = ""
+
+    for char in stem:
+
+        if (
+            char.isalnum()
+            or char in "-_ "
+        ):
+
+            result += char
+
+        else:
+
+            result += "_"
+
+
+    result = result.strip()
+
+
+    return (
+        result
+        or "result"
     )
 
 
-def export_pdf(stem, text, summary, out_dir):
-    name = f"{_safe_stem(stem)}_analysis.pdf"
+# ============================================================
+# 텍스트 줄바꿈
+# ============================================================
 
-    path = Path(out_dir) / name
+def wrap_text(
+    text,
+    font_name,
+    font_size,
+    max_width
+):
 
-    font_candidates = [
-        Path("C:/Windows/Fonts/malgun.ttf"),
-        Path("C:/Windows/Fonts/NanumGothic.ttf"),
-    ]
-
-    font_path = next(
-        (
-            p
-            for p in font_candidates
-            if p.exists()
-        ),
-        None,
+    text = str(
+        text or ""
     )
 
-    if not font_path:
-        raise RuntimeError(
-            "한글 PDF용 폰트를 찾지 못했습니다. "
-            "C:/Windows/Fonts/malgun.ttf를 확인하세요."
+
+    lines = []
+
+    current = ""
+
+
+    for char in text:
+
+        candidate = (
+            current
+            + char
         )
 
-    pdfmetrics.registerFont(
-        TTFont(
-            "Korean",
-            str(font_path)
+
+        width = pdfmetrics.stringWidth(
+            candidate,
+            font_name,
+            font_size
         )
+
+
+        if width <= max_width:
+
+            current = candidate
+
+        else:
+
+            if current:
+
+                lines.append(
+                    current
+                )
+
+            current = char
+
+
+    if current:
+
+        lines.append(
+            current
+        )
+
+
+    return lines
+
+
+# ============================================================
+# PDF 출력
+# ============================================================
+
+def _draw_text(
+    c,
+    text,
+    x,
+    y,
+    max_width,
+    font_size,
+    line_height,
+    margin,
+    page_height
+):
+
+    lines = wrap_text(
+        text,
+        FONT_NAME,
+        font_size,
+        max_width
     )
 
-    styles = getSampleStyleSheet()
 
-    styles["BodyText"].fontName = "Korean"
-    styles["Title"].fontName = "Korean"
-    styles["Heading2"].fontName = "Korean"
+    if not lines:
 
-    doc = SimpleDocTemplate(
-        str(path),
+        lines = [""]
+
+
+    for line in lines:
+
+        if y < margin:
+
+            c.showPage()
+
+            c.setFont(
+                FONT_NAME,
+                font_size
+            )
+
+            y = (
+                page_height
+                - margin
+            )
+
+
+        c.drawString(
+            x,
+            y,
+            line
+        )
+
+
+        y -= line_height
+
+
+    return y
+
+
+# ============================================================
+# PDF 생성
+# ============================================================
+
+def export_pdf(
+    stem,
+    text,
+    summary,
+    out_dir
+):
+    """
+    강의 분석 PDF 생성
+
+    Parameters
+    ----------
+    stem:
+        원본 파일명 stem
+
+    text:
+        전사 원문
+
+    summary:
+        AI 요약
+
+    out_dir:
+        PDF 저장 폴더
+    """
+
+    os.makedirs(
+        out_dir,
+        exist_ok=True
+    )
+
+
+    safe_stem = _safe_stem(
+        stem
+    )
+
+
+    output_path = os.path.join(
+        out_dir,
+        f"{safe_stem}_analysis.pdf"
+    )
+
+
+    # --------------------------------------------------------
+    # PDF 생성
+    # --------------------------------------------------------
+
+    c = canvas.Canvas(
+        output_path,
         pagesize=A4
     )
 
-    story = [
-        Paragraph(
-            "강의 분석 결과",
-            styles["Title"]
-        ),
 
-        Spacer(1, 12),
+    width, height = A4
 
-        Paragraph(
-            summary.get("overview", ""),
-            styles["BodyText"]
-        ),
+    margin = 50
 
-        Spacer(1, 12),
+    max_width = (
+        width
+        - margin * 2
+    )
 
-        Paragraph(
-            "핵심 내용",
-            styles["Heading2"]
-        ),
-    ]
 
-    for item in summary.get(
-        "key_points",
-        []
-    ):
-        story.append(
-            Paragraph(
-                f"• {item}",
-                styles["BodyText"]
-            )
+    # --------------------------------------------------------
+    # 제목
+    # --------------------------------------------------------
+
+    c.setFont(
+        FONT_NAME,
+        18
+    )
+
+
+    c.drawString(
+        margin,
+        height - margin,
+        "강의 분석 결과"
+    )
+
+
+    y = (
+        height
+        - margin
+        - 35
+    )
+
+
+    # --------------------------------------------------------
+    # 요약
+    # --------------------------------------------------------
+
+    c.setFont(
+        FONT_NAME,
+        13
+    )
+
+
+    y = _draw_text(
+        c,
+        "요약",
+        margin,
+        y,
+        max_width,
+        13,
+        20,
+        margin,
+        height
+    )
+
+
+    y -= 8
+
+
+    c.setFont(
+        FONT_NAME,
+        10.5
+    )
+
+
+    y = _draw_text(
+        c,
+        summary or "요약이 없습니다.",
+        margin,
+        y,
+        max_width,
+        10.5,
+        17,
+        margin,
+        height
+    )
+
+
+    y -= 20
+
+
+    # --------------------------------------------------------
+    # 전사 원문
+    # --------------------------------------------------------
+
+    c.setFont(
+        FONT_NAME,
+        13
+    )
+
+
+    y = _draw_text(
+        c,
+        "전사 원문",
+        margin,
+        y,
+        max_width,
+        13,
+        20,
+        margin,
+        height
+    )
+
+
+    y -= 8
+
+
+    c.setFont(
+        FONT_NAME,
+        10.5
+    )
+
+
+    paragraphs = str(
+        text or ""
+    ).splitlines()
+
+
+    for paragraph in paragraphs:
+
+        paragraph = paragraph.strip()
+
+
+        if not paragraph:
+
+            y -= 8
+
+            continue
+
+
+        y = _draw_text(
+            c,
+            paragraph,
+            margin,
+            y,
+            max_width,
+            10.5,
+            17,
+            margin,
+            height
         )
 
-    story += [
-        Spacer(1, 12),
 
-        Paragraph(
-            "전사 원문",
-            styles["Heading2"]
-        ),
+        y -= 5
 
-        Paragraph(
-            text
-            .replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace("\n", "<br/>"),
-            styles["BodyText"]
-        ),
-    ]
 
-    doc.build(story)
+    c.save()
 
-    return name
+
+    return output_path

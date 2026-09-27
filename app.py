@@ -1,24 +1,25 @@
+import atexit
+import json
+import logging
 import os
 import threading
-import atexit
-import logging
 from logging.handlers import RotatingFileHandler
 
-from flask import Flask, request, render_template, send_file, jsonify
+from flask import Flask, jsonify, render_template, request, send_file
 from werkzeug.utils import secure_filename
 
-from services.transcribe import transcribe_media
-from services.export_txt import export_txt
-from services.export_srt import export_srt
 from services.export_docx import export_docx
+from services.export_json import export_json
 from services.export_pdf import export_pdf
+from services.export_srt import export_srt
+from services.export_txt import export_txt
+from services.summarize import analyze_lecture
+from services.transcribe import transcribe_media
 
 
-# =========================================================
-# Flask 기본 설정
-# =========================================================
-
-app = Flask(__name__)
+# ============================================================
+# 기본 경로
+# ============================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -26,162 +27,103 @@ UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 OUTPUT_FOLDER = os.path.join(BASE_DIR, "outputs")
 LOG_FOLDER = os.path.join(BASE_DIR, "logs")
 
-# 지원하는 미디어 파일
-ALLOWED_EXTENSIONS = {
-    "mp3",
-    "mp4",
-    "wav",
-    "m4a",
-    "webm"
-}
-
-# 최대 업로드 크기: 2GB
-app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024 * 1024
-
-
-# =========================================================
-# 폴더 자동 생성
-# =========================================================
-
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 os.makedirs(LOG_FOLDER, exist_ok=True)
 
 
-# =========================================================
-# Logging 설정
-# =========================================================
+# ============================================================
+# Flask
+# ============================================================
 
-LOG_FORMAT = (
-    "%(asctime)s | %(levelname)s | "
-    "%(name)s | %(message)s"
-)
+app = Flask(__name__)
 
-DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+# 최대 2GB
+app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024 * 1024
+
+ALLOWED_EXTENSIONS = {
+    "mp3",
+    "mp4",
+    "wav",
+    "m4a",
+    "webm",
+}
 
 
-def create_logger(name, filename, level=logging.INFO):
-    """
-    로그 파일과 터미널에 동시에 로그를 출력하는 Logger를 생성합니다.
+# ============================================================
+# Logger
+# ============================================================
 
-    로그 파일이 5MB를 넘으면 자동으로 백업합니다.
-    """
-
+def _logger(name, filename):
     logger = logging.getLogger(name)
-    logger.setLevel(level)
+    logger.setLevel(logging.INFO)
 
-    # 중복 Handler 생성 방지
-    if logger.handlers:
-        return logger
+    if not logger.handlers:
+        handler = RotatingFileHandler(
+            os.path.join(LOG_FOLDER, filename),
+            maxBytes=5 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        )
 
-    formatter = logging.Formatter(
-        LOG_FORMAT,
-        datefmt=DATE_FORMAT
-    )
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+            )
+        )
 
-    # 파일 로그
-    file_handler = RotatingFileHandler(
-        os.path.join(LOG_FOLDER, filename),
-        maxBytes=5 * 1024 * 1024,
-        backupCount=5,
-        encoding="utf-8"
-    )
-
-    file_handler.setFormatter(formatter)
-    file_handler.setLevel(level)
-
-    # 터미널 로그
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    console_handler.setLevel(level)
-
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
+        logger.addHandler(handler)
 
     return logger
 
 
-# 서버 관련 로그
-server_logger = create_logger(
+server_logger = _logger(
     "server",
-    "server.log",
-    logging.INFO
+    "server.log"
 )
 
-# 오류 전용 로그
-error_logger = create_logger(
+error_logger = _logger(
     "error",
-    "error.log",
-    logging.ERROR
+    "error.log"
 )
 
-# 전사 작업 로그
-transcription_logger = create_logger(
+transcription_logger = _logger(
     "transcription",
-    "transcription.log",
-    logging.INFO
+    "transcription.log"
 )
 
 
-# =========================================================
-# Flask / Werkzeug HTTP 로그
-# =========================================================
+# ============================================================
+# 전역 상태
+# ============================================================
 
-werkzeug_logger = logging.getLogger("werkzeug")
-
-if not any(
-    isinstance(handler, RotatingFileHandler)
-    for handler in werkzeug_logger.handlers
-):
-    werkzeug_handler = RotatingFileHandler(
-        os.path.join(LOG_FOLDER, "server.log"),
-        maxBytes=5 * 1024 * 1024,
-        backupCount=5,
-        encoding="utf-8"
-    )
-
-    werkzeug_handler.setFormatter(
-        logging.Formatter(
-            LOG_FORMAT,
-            datefmt=DATE_FORMAT
-        )
-    )
-
-    werkzeug_logger.addHandler(werkzeug_handler)
-
-werkzeug_logger.setLevel(logging.INFO)
-
-
-# =========================================================
-# 전사 결과 상태
-# =========================================================
+state_lock = threading.Lock()
 
 latest_result = {
     "stem": "",
+    "filename": "",
     "text": "",
+    "segments": [],
     "summary": "",
-    "segments": []
+    "key_points": [],
+    "keywords": [],
+    "chapters": [],
+    "model": "",
 }
 
 progress_state = {
     "percent": 0,
     "status": "idle",
-    "error": ""
+    "error": "",
+    "stage": "대기 중",
 }
 
-# 여러 스레드에서 동시에 상태를 변경할 때 충돌 방지
-state_lock = threading.Lock()
 
-
-# =========================================================
-# 파일 확장자 확인
-# =========================================================
+# ============================================================
+# 파일 관련
+# ============================================================
 
 def allowed_file(filename):
-    """
-    업로드 가능한 파일인지 확인합니다.
-    """
-
     return (
         "." in filename
         and filename.rsplit(".", 1)[1].lower()
@@ -189,661 +131,630 @@ def allowed_file(filename):
     )
 
 
-# =========================================================
-# 전사 작업
-# =========================================================
+def _reset_state(filename):
 
-def run_transcription(save_path):
-    """
-    실제 음성 전사를 별도 스레드에서 실행합니다.
-    """
-
-    filename = os.path.basename(save_path)
-
-    transcription_logger.info(
-        "전사 작업 시작 | file=%s",
-        filename
-    )
+    stem = os.path.splitext(filename)[0]
 
     with state_lock:
-        progress_state["status"] = "processing"
-        progress_state["percent"] = 0
-        progress_state["error"] = ""
+
+        latest_result.update({
+            "stem": stem,
+            "filename": filename,
+            "text": "",
+            "segments": [],
+            "summary": "",
+            "key_points": [],
+            "keywords": [],
+            "chapters": [],
+            "model": "",
+        })
+
+        progress_state.update({
+            "percent": 0,
+            "status": "processing",
+            "error": "",
+            "stage": "파일 분석 중",
+        })
+
+
+# ============================================================
+# 전사 + AI 분석
+# ============================================================
+
+def run_transcription(save_path, filename):
 
     try:
 
-        def update(p):
-            """
-            전사 진행률 업데이트
-            """
+        # ----------------------------------------------------
+        # Whisper 전사 진행률
+        # ----------------------------------------------------
+
+        def update_transcription(percent):
 
             with state_lock:
 
-                # 진행률이 뒤로 가지 않도록 처리
-                if p > progress_state["percent"]:
-                    progress_state["percent"] = p
+                progress_state["percent"] = max(
+                    progress_state["percent"],
+                    int(percent)
+                )
 
-        # 실제 전사 실행
+                progress_state["stage"] = "음성 전사 중"
+
+
+        # ----------------------------------------------------
+        # Whisper
+        # ----------------------------------------------------
+
         text, segments = transcribe_media(
             save_path,
-            progress_callback=update
+            progress_callback=update_transcription
         )
 
+
+        # ----------------------------------------------------
         # 전사 결과 저장
+        # ----------------------------------------------------
+
         with state_lock:
 
             latest_result["text"] = text
             latest_result["segments"] = segments
 
-            progress_state["status"] = "done"
-            progress_state["percent"] = 100
-            progress_state["error"] = ""
+            progress_state["percent"] = 91
+            progress_state["stage"] = "AI 요약 준비 중"
 
-        transcription_logger.info(
-            "전사 작업 완료 | file=%s | segments=%d | text_length=%d",
-            filename,
-            len(segments),
-            len(text)
+
+        # ----------------------------------------------------
+        # Ollama / Qwen3 분석
+        # ----------------------------------------------------
+
+        analysis = analyze_lecture(
+            segments
         )
 
-    except Exception as e:
 
-        # 사용자 화면에 표시할 오류
+        # ----------------------------------------------------
+        # 분석 결과 저장
+        # ----------------------------------------------------
+
         with state_lock:
 
-            progress_state["status"] = "error"
-            progress_state["error"] = str(e)
+            latest_result["summary"] = analysis.get(
+                "summary",
+                ""
+            )
 
-        # 상세 traceback
+            latest_result["key_points"] = analysis.get(
+                "key_points",
+                []
+            )
+
+            latest_result["keywords"] = analysis.get(
+                "keywords",
+                []
+            )
+
+            latest_result["chapters"] = analysis.get(
+                "chapters",
+                []
+            )
+
+            latest_result["model"] = analysis.get(
+                "model",
+                ""
+            )
+
+            progress_state["percent"] = 100
+            progress_state["status"] = "done"
+            progress_state["stage"] = "완료되었습니다."
+
+
+        server_logger.info(
+            "작업 완료 | file=%s | model=%s",
+            filename,
+            latest_result["model"]
+        )
+
+
+    except Exception as exc:
+
         error_logger.exception(
-            "전사 작업 중 오류 발생 | file=%s",
+            "전사/분석 실패 | file=%s",
             filename
         )
 
-        transcription_logger.exception(
-            "전사 작업 실패 | file=%s",
-            filename
+        with state_lock:
+
+            progress_state.update({
+                "status": "error",
+                "stage": "오류가 발생했습니다.",
+                "error": str(exc),
+            })
+
+
+# ============================================================
+# 상태 API용 데이터
+# ============================================================
+
+def _result_payload():
+
+    with state_lock:
+
+        return json.loads(
+            json.dumps(
+                latest_result,
+                ensure_ascii=False
+            )
         )
 
 
-# =========================================================
-# 문단 분리
-# =========================================================
+def _progress_payload():
 
-def group_into_paragraphs(segments, gap_threshold=2.0):
-    """
-    세그먼트 사이의 침묵 간격이 gap_threshold(초) 이상이면
-    새로운 문단으로 분리합니다.
-    """
+    with state_lock:
 
-    if not segments:
-        return []
-
-    paragraphs = []
-
-    current_paragraph = [
-        segments[0]["text"]
-    ]
-
-    for i in range(1, len(segments)):
-
-        prev_end = segments[i - 1]["end"]
-        curr_start = segments[i]["start"]
-
-        gap = curr_start - prev_end
-
-        if gap >= gap_threshold:
-
-            paragraphs.append(
-                " ".join(current_paragraph)
-            )
-
-            current_paragraph = [
-                segments[i]["text"]
-            ]
-
-        else:
-
-            current_paragraph.append(
-                segments[i]["text"]
-            )
-
-    if current_paragraph:
-
-        paragraphs.append(
-            " ".join(current_paragraph)
+        return dict(
+            progress_state
         )
 
-    return paragraphs
 
-
-# =========================================================
+# ============================================================
 # 메인 페이지
-# =========================================================
+# ============================================================
 
 @app.route("/")
 def home():
 
-    try:
-
-        with state_lock:
-
-            segments = list(
-                latest_result["segments"]
-            )
-
-            text = latest_result["text"]
-
-        paragraphs = group_into_paragraphs(
-            segments
-        )
-
-        return render_template(
-            "index.html",
-            text=text,
-            paragraphs=paragraphs
-        )
-
-    except Exception:
-
-        error_logger.exception(
-            "메인 페이지 처리 중 오류 발생"
-        )
-
-        return "서버 오류가 발생했습니다.", 500
+    return render_template(
+        "index.html"
+    )
 
 
-# =========================================================
-# API Health Check
-# =========================================================
+# ============================================================
+# Health Check
+# ============================================================
 
-@app.route("/api/health", methods=["GET"])
+@app.route("/api/health")
 def api_health():
 
     return jsonify({
-        "status": "ok",
-        "message": "my-transcriber server is running"
-    }), 200
+        "ok": True,
+        "service": "my-transcriber",
+    })
 
 
-# =========================================================
-# 파일 업로드
-# =========================================================
+# ============================================================
+# 업로드
+# ============================================================
 
-@app.route("/upload", methods=["POST"])
-@app.route("/api/upload", methods=["POST"])
+@app.route(
+    "/upload",
+    methods=["POST"]
+)
+@app.route(
+    "/api/upload",
+    methods=["POST"]
+)
 def upload():
 
-    try:
+    if "media" not in request.files:
 
-        if "media" not in request.files:
+        return jsonify({
+            "ok": False,
+            "error": "파일이 없습니다.",
+        }), 400
 
-            server_logger.warning(
-                "파일 업로드 실패 | 파일이 요청에 없음"
-            )
 
-            return jsonify({
-                "success": False,
-                "error": "파일이 없습니다."
-            }), 400
+    file = request.files["media"]
 
-        file = request.files["media"]
 
-        if file.filename == "":
+    if not file.filename:
 
-            server_logger.warning(
-                "파일 업로드 실패 | 파일명이 없음"
-            )
+        return jsonify({
+            "ok": False,
+            "error": "파일을 선택하세요.",
+        }), 400
 
-            return jsonify({
-                "success": False,
-                "error": "파일을 선택하세요."
-            }), 400
 
-        if not allowed_file(file.filename):
+    if not allowed_file(file.filename):
 
-            server_logger.warning(
-                "파일 업로드 실패 | 지원하지 않는 형식 | filename=%s",
-                file.filename
-            )
+        return jsonify({
+            "ok": False,
+            "error": (
+                "MP3 / MP4 / WAV / M4A / WEBM "
+                "파일만 업로드할 수 있습니다."
+            ),
+        }), 400
 
-            return jsonify({
-                "success": False,
-                "error": (
-                    "지원하지 않는 파일 형식입니다. "
-                    "MP3, MP4, WAV, M4A, WEBM 파일을 "
-                    "업로드해주세요."
-                )
-            }), 400
 
-        filename = secure_filename(
-            file.filename
-        )
+    filename = secure_filename(
+        file.filename
+    )
 
-        # 동일한 파일명이 존재할 경우 덮어쓰기 방지
-        save_path = os.path.join(
+
+    # 같은 이름의 파일이 있으면 _1, _2...
+    stem, ext = os.path.splitext(filename)
+
+    candidate = filename
+    index = 1
+
+    while os.path.exists(
+        os.path.join(
             UPLOAD_FOLDER,
-            filename
+            candidate
+        )
+    ):
+
+        candidate = (
+            f"{stem}_{index}{ext}"
         )
 
-        # 기존 파일이 있다면 이름 뒤에 번호 추가
-        if os.path.exists(save_path):
-
-            base, ext = os.path.splitext(filename)
-
-            counter = 1
-
-            while True:
-
-                new_filename = (
-                    f"{base}_{counter}{ext}"
-                )
-
-                new_path = os.path.join(
-                    UPLOAD_FOLDER,
-                    new_filename
-                )
-
-                if not os.path.exists(new_path):
-                    filename = new_filename
-                    save_path = new_path
-                    break
-
-                counter += 1
-
-        # 파일 저장
-        file.save(save_path)
-
-        server_logger.info(
-            "파일 업로드 완료 | file=%s",
-            filename
-        )
-
-        # 전사 상태 초기화
-        with state_lock:
-
-            latest_result["text"] = ""
-            latest_result["segments"] = []
-
-            progress_state["percent"] = 0
-            progress_state["status"] = "processing"
-            progress_state["error"] = ""
-
-        # 전사 작업을 별도 스레드에서 실행
-        thread = threading.Thread(
-            target=run_transcription,
-            args=(save_path,),
-            daemon=True
-        )
-
-        thread.start()
-
-        # API 요청이면 JSON 응답
-        if request.path.startswith("/api/"):
-
-            return jsonify({
-                "success": True,
-                "message": "파일 업로드가 완료되었습니다.",
-                "filename": filename,
-                "status": "processing"
-            }), 200
-
-        # 기존 /upload 방식도 유지
-        return render_template(
-            "index.html",
-            text="",
-            paragraphs=[],
-            processing=True
-        )
-
-    except Exception:
-
-        error_logger.exception(
-            "파일 업로드 처리 중 오류 발생"
-        )
-
-        if request.path.startswith("/api/"):
-
-            return jsonify({
-                "success": False,
-                "error": "파일 업로드 중 오류가 발생했습니다."
-            }), 500
-
-        return "파일 업로드 중 오류가 발생했습니다.", 500
+        index += 1
 
 
-# =========================================================
-# 전사 진행률
-# =========================================================
+    filename = candidate
+
+
+    save_path = os.path.join(
+        UPLOAD_FOLDER,
+        filename
+    )
+
+
+    file.save(
+        save_path
+    )
+
+
+    _reset_state(
+        filename
+    )
+
+
+    server_logger.info(
+        "파일 업로드 완료 | file=%s",
+        filename
+    )
+
+
+    # 백그라운드 전사
+    thread = threading.Thread(
+        target=run_transcription,
+        args=(save_path, filename),
+        daemon=True,
+    )
+
+    thread.start()
+
+
+    return jsonify({
+        "ok": True,
+        "job_id": "latest",
+        "filename": filename,
+    })
+
+
+# ============================================================
+# 진행률
+# ============================================================
 
 @app.route("/progress")
 @app.route("/api/progress")
 def progress():
 
-    try:
-
-        with state_lock:
-
-            current_state = progress_state.copy()
-
-        return jsonify(
-            current_state
-        )
-
-    except Exception:
-
-        error_logger.exception(
-            "전사 진행률 조회 중 오류 발생"
-        )
-
-        return jsonify({
-            "percent": 0,
-            "status": "error",
-            "error": (
-                "진행률을 가져오는 중 "
-                "오류가 발생했습니다."
-            )
-        }), 500
+    return jsonify(
+        _progress_payload()
+    )
 
 
-# =========================================================
-# 전사 결과 조회 API
-# =========================================================
+# ============================================================
+# 결과
+# ============================================================
 
-@app.route("/api/result", methods=["GET"])
+@app.route("/api/result")
 def api_result():
 
-    try:
-
-        with state_lock:
-
-            result = {
-                "text": latest_result["text"],
-                "segments": list(
-                    latest_result["segments"]
-                ),
-                "status": progress_state["status"],
-                "percent": progress_state["percent"],
-                "error": progress_state["error"]
-            }
-
-        return jsonify(result), 200
-
-    except Exception:
-
-        error_logger.exception(
-            "전사 결과 조회 중 오류 발생"
-        )
-
-        return jsonify({
-            "success": False,
-            "error": "전사 결과를 가져오는 중 오류가 발생했습니다."
-        }), 500
+    return jsonify(
+        _result_payload()
+    )
 
 
-# =========================================================
-# 파일 다운로드
-# =========================================================
+# ============================================================
+# 기존 프론트 호환용
+# ============================================================
 
-@app.route("/download/<fmt>")
-@app.route("/api/download/<fmt>")
+@app.route(
+    "/api/jobs/<job_id>"
+)
+def api_job(job_id):
+
+    return jsonify({
+        "job_id": job_id,
+        **_progress_payload(),
+        "result": _result_payload(),
+    })
+
+
+# ============================================================
+# 다운로드
+# ============================================================
+
+@app.route(
+    "/download/<fmt>"
+)
+@app.route(
+    "/api/download/<fmt>"
+)
 def download(fmt):
 
-    try:
+    fmt = fmt.lower()
 
-        with state_lock:
+    result = _result_payload()
 
-            text = latest_result["text"]
 
-            segments = list(
-                latest_result["segments"]
-            )
+    if not result["text"]:
 
-        if not text:
+        return jsonify({
+            "ok": False,
+            "error": "먼저 전사를 진행하세요.",
+        }), 400
 
-            server_logger.warning(
-                "다운로드 실패 | 전사 결과 없음 | format=%s",
-                fmt
-            )
 
-            if request.path.startswith("/api/"):
+    stem = result.get(
+        "stem"
+    ) or "result"
 
-                return jsonify({
-                    "success": False,
-                    "error": "먼저 전사를 진행하세요."
-                }), 400
 
-            return "먼저 전사를 진행하세요.", 400
+    # --------------------------------------------------------
+    # TXT
+    # --------------------------------------------------------
 
-        filename = f"result.{fmt}"
+    if fmt == "txt":
 
         output_path = os.path.join(
             OUTPUT_FOLDER,
-            filename
+            f"{stem}.txt"
         )
 
-        # TXT
-        if fmt == "txt":
+        export_txt(
+            result["text"],
+            output_path
+        )
 
-            export_txt(
-                text,
-                output_path
+
+    # --------------------------------------------------------
+    # SRT
+    # --------------------------------------------------------
+
+    elif fmt == "srt":
+
+        output_path = os.path.join(
+            OUTPUT_FOLDER,
+            f"{stem}.srt"
+        )
+
+        export_srt(
+            result["segments"],
+            output_path
+        )
+
+
+    # --------------------------------------------------------
+    # DOCX
+    # --------------------------------------------------------
+
+    elif fmt == "docx":
+
+        output_path = os.path.join(
+            OUTPUT_FOLDER,
+            f"{stem}.docx"
+        )
+
+        paragraphs = group_into_paragraphs(
+            result["segments"]
+        )
+
+        export_docx(
+            paragraphs,
+            output_path,
+            title="강의 전사본"
+        )
+
+
+    # --------------------------------------------------------
+    # PDF
+    # --------------------------------------------------------
+
+    elif fmt == "pdf":
+
+        output_path = export_pdf(
+            stem,
+            result["text"],
+            result["summary"],
+            OUTPUT_FOLDER
+        )
+
+
+    # --------------------------------------------------------
+    # JSON
+    # --------------------------------------------------------
+
+    elif fmt == "json":
+
+        output_path = os.path.join(
+            OUTPUT_FOLDER,
+            f"{stem}_analysis.json"
+        )
+
+        export_json(
+            result,
+            output_path
+        )
+
+
+    else:
+
+        return jsonify({
+            "ok": False,
+            "error": "지원하지 않는 형식입니다.",
+        }), 400
+
+
+    server_logger.info(
+        "파일 다운로드 완료 | format=%s | path=%s",
+        fmt,
+        output_path
+    )
+
+
+    return send_file(
+        output_path,
+        as_attachment=True
+    )
+
+
+# ============================================================
+# 문단 묶기
+# ============================================================
+
+def group_into_paragraphs(
+    segments,
+    gap_threshold=2.0
+):
+
+    if not segments:
+        return []
+
+
+    paragraphs = []
+
+    current = [
+        segments[0]["text"]
+    ]
+
+
+    for i in range(
+        1,
+        len(segments)
+    ):
+
+        gap = (
+            float(segments[i]["start"])
+            - float(segments[i - 1]["end"])
+        )
+
+
+        if gap >= gap_threshold:
+
+            paragraphs.append(
+                " ".join(current)
             )
 
-        # SRT
-        elif fmt == "srt":
-
-            export_srt(
-                segments,
-                output_path
-            )
-
-        # DOCX
-        elif fmt == "docx":
-
-            paragraphs = group_into_paragraphs(
-                segments
-            )
-
-            export_docx(
-                paragraphs,
-                output_path
-            )
-
-        # PDF
-        elif fmt == "pdf":
-
-            with state_lock:
-                stem = latest_result.get("stem", "result")
-                text = latest_result.get("text", "")
-                summary = latest_result.get("summary", "")
-
-            export_pdf(
-                stem,
-                text,
-                summary,
-                OUTPUT_FOLDER
-            )
-
-            output_path = os.path.join(
-                OUTPUT_FOLDER,
-                f"{stem}_analysis.pdf"
-            )
+            current = [
+                segments[i]["text"]
+            ]
 
         else:
 
-            server_logger.warning(
-                "다운로드 실패 | 지원하지 않는 형식 | format=%s",
-                fmt
+            current.append(
+                segments[i]["text"]
             )
 
-            if request.path.startswith("/api/"):
 
-                return jsonify({
-                    "success": False,
-                    "error": "지원하지 않는 형식입니다."
-                }), 400
+    if current:
 
-            return "지원하지 않는 형식입니다.", 400
-
-        server_logger.info(
-            "파일 다운로드 완료 | format=%s",
-            fmt
+        paragraphs.append(
+            " ".join(current)
         )
 
-        return send_file(
-            output_path,
-            as_attachment=True
-        )
 
-    except Exception:
-
-        error_logger.exception(
-            "파일 다운로드 처리 중 오류 발생 | format=%s",
-            fmt
-        )
-
-        if request.path.startswith("/api/"):
-
-            return jsonify({
-                "success": False,
-                "error": "파일 생성 중 오류가 발생했습니다."
-            }), 500
-
-        return "파일 생성 중 오류가 발생했습니다.", 500
+    return paragraphs
 
 
-# =========================================================
-# 404 처리
-# =========================================================
-
-@app.errorhandler(404)
-def page_not_found(error):
-
-    server_logger.warning(
-        "404 Not Found | path=%s",
-        request.path
-    )
-
-    # API 요청에는 JSON으로 응답
-    if request.path.startswith("/api/"):
-
-        return jsonify({
-            "success": False,
-            "error": "요청한 API 경로를 찾을 수 없습니다.",
-            "path": request.path
-        }), 404
-
-    return "페이지를 찾을 수 없습니다.", 404
-
-
-# =========================================================
-# 413 처리
-# =========================================================
+# ============================================================
+# 오류 처리
+# ============================================================
 
 @app.errorhandler(413)
-def request_entity_too_large(error):
+def too_large(error):
 
-    server_logger.warning(
-        "파일 용량 초과 | path=%s",
+    return jsonify({
+        "ok": False,
+        "error": (
+            "파일 크기가 너무 큽니다. "
+            "최대 2GB까지 업로드할 수 있습니다."
+        ),
+    }), 413
+
+
+@app.errorhandler(404)
+def not_found(error):
+
+    if request.path.startswith(
+        "/api/"
+    ):
+
+        return jsonify({
+            "ok": False,
+            "error": "API 경로를 찾을 수 없습니다.",
+            "path": request.path,
+        }), 404
+
+
+    return (
+        "페이지를 찾을 수 없습니다.",
+        404
+    )
+
+
+@app.errorhandler(500)
+def internal_error(error):
+
+    error_logger.exception(
+        "500 Internal Server Error | path=%s",
         request.path
     )
 
-    message = (
-        "파일 크기가 너무 큽니다. "
-        "최대 2GB까지 업로드할 수 있습니다."
-    )
 
-    if request.path.startswith("/api/"):
+    if request.path.startswith(
+        "/api/"
+    ):
 
         return jsonify({
-            "success": False,
-            "error": message
-        }), 413
-
-    return message, 413
-
-
-# =========================================================
-# 500 처리
-# =========================================================
-
-@app.errorhandler(500)
-def internal_server_error(error):
-
-    error_logger.error(
-        "500 Internal Server Error | path=%s | error=%s",
-        request.path,
-        error
-    )
-
-    if request.path.startswith("/api/"):
-
-        return jsonify({
-            "success": False,
-            "error": "서버 내부 오류가 발생했습니다."
+            "ok": False,
+            "error": "서버 내부 오류가 발생했습니다.",
         }), 500
 
-    return "서버 내부 오류가 발생했습니다.", 500
+
+    return (
+        "서버 내부 오류가 발생했습니다.",
+        500
+    )
 
 
-# =========================================================
-# 정상 종료 로그
-# =========================================================
+# ============================================================
+# 종료
+# ============================================================
 
 @atexit.register
 def shutdown_server():
 
-    server_logger.info("=" * 60)
-    server_logger.info("SERVER_SHUTDOWN")
     server_logger.info(
-        "Flask 서버가 정상적으로 종료되었습니다."
+        "SERVER_SHUTDOWN"
     )
-    server_logger.info("=" * 60)
 
 
-# =========================================================
-# 서버 실행
-# =========================================================
+# ============================================================
+# 실행
+# ============================================================
 
 if __name__ == "__main__":
 
-    server_logger.info("=" * 60)
-    server_logger.info("SERVER_START")
-
     server_logger.info(
-        "Flask 서버를 시작합니다."
-    )
-
-    server_logger.info(
-        "Upload folder: %s",
-        UPLOAD_FOLDER
-    )
-
-    server_logger.info(
-        "Output folder: %s",
+        "SERVER_START | upload=%s | output=%s",
+        UPLOAD_FOLDER,
         OUTPUT_FOLDER
     )
 
-    server_logger.info(
-        "Log folder: %s",
-        LOG_FOLDER
-    )
-
-    server_logger.info(
-        "Allowed extensions: %s",
-        ", ".join(
-            sorted(ALLOWED_EXTENSIONS)
-        )
-    )
-
-    server_logger.info(
-        "Max upload size: 2GB"
-    )
-
-    server_logger.info("=" * 60)
-
-    # 자동 reloader를 끄기 위해 use_reloader=False
     app.run(
         debug=True,
         use_reloader=False

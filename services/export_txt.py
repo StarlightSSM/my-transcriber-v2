@@ -1,20 +1,19 @@
-from pathlib import Path
+def export_txt(
+    text,
+    output_path
+):
+    """
+    전사 결과를 TXT 파일로 저장합니다.
+    """
 
+    with open(
+        output_path,
+        "w",
+        encoding="utf-8-sig"
+    ) as file:
 
-def _safe_stem(stem):
-    return "".join(
-        c if c not in '\\/:*?"<>|' else "_"
-        for c in stem
-    )
+        file.write(
+            text or ""
+        )
 
-
-def export_txt(stem, text, out_dir):
-    name = f"{_safe_stem(stem)}_transcript.txt"
-
-    output_path = Path(out_dir) / name
-    output_path.write_text(
-        text,
-        encoding="utf-8"
-    )
-
-    return name
+    return output_path

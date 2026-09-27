@@ -1,60 +1,56 @@
-from pathlib import Path
-
 from docx import Document
+from docx.shared import Pt
 
 
-def _safe_stem(stem):
-    return "".join(
-        c if c not in '\\/:*?"<>|' else "_"
-        for c in stem
-    )
+def export_docx(
+    paragraphs,
+    output_path,
+    title="강의 전사본"
+):
+    """
+    전사 결과를 DOCX 파일로 저장합니다.
 
+    paragraphs:
+        문자열 리스트
 
-def export_docx(stem, text, summary, out_dir):
-    name = f"{_safe_stem(stem)}_analysis.docx"
+    output_path:
+        저장할 DOCX 파일 경로
 
-    output_path = Path(out_dir) / name
+    title:
+        문서 제목
+    """
 
-    doc = Document()
+    document = Document()
 
-    doc.add_heading(
-        "강의 분석 결과",
+    # 기본 글꼴
+    style = document.styles["Normal"]
+
+    style.font.name = "맑은 고딕"
+    style.font.size = Pt(10.5)
+
+    # 제목
+    document.add_heading(
+        title,
         level=1
     )
 
-    doc.add_paragraph(
-        summary.get("overview", "")
-    )
+    # 본문
+    for paragraph in paragraphs:
 
-    doc.add_heading(
-        "핵심 내용",
-        level=2
-    )
+        if paragraph is None:
+            continue
 
-    for item in summary.get("key_points", []):
-        doc.add_paragraph(
-            item,
-            style="List Bullet"
+        paragraph = str(paragraph).strip()
+
+        if not paragraph:
+            continue
+
+        document.add_paragraph(
+            paragraph
         )
 
-    doc.add_heading(
-        "키워드",
-        level=2
+    document.save(
+        output_path
     )
 
-    doc.add_paragraph(
-        ", ".join(
-            summary.get("keywords", [])
-        )
-    )
-
-    doc.add_heading(
-        "전사 원문",
-        level=2
-    )
-
-    doc.add_paragraph(text)
-
-    doc.save(output_path)
-
-    return name
+    return output_path
